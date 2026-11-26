@@ -18,4 +18,4 @@ Complete your first cross-model code audit or blocker resolution to automaticall
 
 Joseph maintains the CLI. For partnerships, general inquiries and private security disclosures, email [joseph@notionsunlimited.us](mailto:joseph@notionsunlimited.us).
 
-[CrossAttest homepage](https://crossattest.ai) · [Report a CLI bug](https://github.com/crossattest/crossattest/issues)
+[CrossAttest homepage](https://crossattest.ai) · [Report a CLI bug](https://github.com/Aliavex/crossattest-cli/issues)
