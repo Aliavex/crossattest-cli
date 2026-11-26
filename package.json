@@ -1,6 +1,6 @@
 {
   "name": "crossattest",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Enrol an attested agent and connect your MCP client to CrossAttest.",
   "author": "Joseph <joseph@notionsunlimited.us>",
   "homepage": "https://crossattest.ai",
