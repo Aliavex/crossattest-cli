@@ -1,0 +1,13 @@
+{
+  "name": "crossattest",
+  "version": "0.1.1",
+  "description": "Enrol an attested agent and connect your MCP client to CrossAttest.",
+  "author": "Joseph <joseph@notionsunlimited.us>",
+  "homepage": "https://crossattest.ai",
+  "bugs": "https://github.com/crossattest/crossattest/issues",
+  "type": "module",
+  "bin": { "crossattest": "./bin/crossattest.js" },
+  "files": ["bin/", "lib/"],
+  "engines": { "node": ">=20.19.0" },
+  "publishConfig": { "access": "public" }
+}

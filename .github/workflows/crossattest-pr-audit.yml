@@ -1,0 +1,154 @@
+# Configure CROSSATTEST_API_URL (repository variable, HTTPS origin) and
+# CROSSATTEST_API_KEY (Actions secret, verified author of the submitted work).
+name: CrossAttest PR audit
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  schedule:
+    - cron: '17 * * * *'
+permissions:
+  contents: read
+  pull-requests: write
+concurrency:
+  group: crossattest-pr-${{ github.event.pull_request.number || 'late-reviews' }}
+  cancel-in-progress: true
+jobs:
+  audit:
+    if: github.event_name == 'schedule' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]' && github.actor != 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - name: Submit the pinned diff and publish the verified review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CROSSATTEST_API_URL: ${{ vars.CROSSATTEST_API_URL }}
+          CROSSATTEST_API_KEY: ${{ secrets.CROSSATTEST_API_KEY }}
+        shell: bash
+        run: |
+          node --input-type=module <<'CROSSATTEST_JS'
+          import { execFileSync } from 'node:child_process';
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { setTimeout as sleep } from 'node:timers/promises';
+
+          const env = process.env;
+          if (!env.CROSSATTEST_API_URL || !env.CROSSATTEST_API_KEY) {
+            throw new Error('Configure CROSSATTEST_API_URL and CROSSATTEST_API_KEY for this repository.');
+          }
+          const origin = new URL(env.CROSSATTEST_API_URL);
+          if (origin.protocol !== 'https:' || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) {
+            throw new Error('CROSSATTEST_API_URL must be an HTTPS origin.');
+          }
+          const repo = env.GITHUB_REPOSITORY;
+          if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error('Invalid repository.');
+          const sha = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+          const resource = '/api/integrations/github-pr';
+          async function request(path, body) {
+            const response = await fetch(new URL(path, origin), {
+              method: body === undefined ? 'GET' : 'POST',
+              headers: { Authorization: 'Bearer ' + env.CROSSATTEST_API_KEY, 'Content-Type': 'application/json' },
+              body: body === undefined ? undefined : JSON.stringify(body),
+              redirect: 'error', signal: AbortSignal.timeout(20_000),
+            });
+            if (!response.ok) throw new Error('CrossAttest returned HTTP ' + response.status + ' for ' + path);
+            return response.json();
+          }
+          function gh(...args) {
+            try {
+              return execFileSync('gh', args, {
+                encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
+              });
+            } catch (error) {
+              // Avoid dumping captured diff or comment text into the job log.
+              throw new Error('GitHub CLI ' + args[0] + ' failed (' + (error.code || error.status || 'timeout') + ').');
+            }
+          }
+
+          function validateRevision({ number, base_sha, head_sha }) {
+            if (!Number.isSafeInteger(number) || number < 1 || !sha.test(base_sha) || !sha.test(head_sha)) {
+              throw new Error('Invalid PR coordinates.');
+            }
+          }
+          function isCurrent(revision) {
+            const query = '{state,base:.base.sha,head:.head.sha,repo:.head.repo.full_name,author:.user.login} | @json';
+            const current = JSON.parse(gh('api', 'repos/' + repo + '/pulls/' + revision.number, '--jq', query));
+            return current.state === 'open' && current.base === revision.base_sha && current.head === revision.head_sha &&
+              current.repo === repo && current.author !== 'dependabot[bot]';
+          }
+          const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+          async function publish(id, revision, report, existingOnly) {
+            if (!uuid.test(id) || report.post_id !== id || typeof report.markdown !== 'string' ||
+                !Number.isSafeInteger(report.review_count) || report.review_count < 0) {
+              throw new Error('Unexpected CrossAttest review response.');
+            }
+            const ack = () => report.review_count > 0 && request(resource + '/' + id + '/delivery', { review_count: report.review_count });
+            if (!isCurrent(revision)) {
+              await ack();
+              return false;
+            }
+            const marker = '<!-- crossattest-review:' + id + ' -->';
+            const comments = 'repos/' + repo + '/issues/' + revision.number + '/comments?per_page=100';
+            const filter = '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("' + marker + '"))) | {id,body} | @json';
+            const row = gh('api', '--paginate', comments, '--jq', filter).trim().split(/\r?\n/).at(-1);
+            const comment = row ? JSON.parse(row) : null;
+            const body = marker + '\n<!-- crossattest-count:' + report.review_count + ' -->\nReview of `' + revision.head_sha +
+              '` against `' + revision.base_sha + '`.\n\n' + report.markdown;
+            if (comment) {
+              if (!Number.isSafeInteger(comment.id) || typeof comment.body !== 'string') throw new Error('Unexpected GitHub comment.');
+              const previous = /^<!-- crossattest-count:(\d+) -->$/m.exec(comment.body.split('\n')[1] || '');
+              if (comment.body !== body && Number(previous?.[1] || 0) <= report.review_count) {
+                const input = join(env.RUNNER_TEMP, 'crossattest-comment.json');
+                writeFileSync(input, JSON.stringify({ body }), { mode: 0o600 });
+                gh('api', '--method', 'PATCH', 'repos/' + repo + '/issues/comments/' + comment.id, '--input', input, '--silent');
+              }
+            } else {
+              // A schedule can race the original job before it creates its pending comment.
+              if (existingOnly) return false;
+              const file = join(env.RUNNER_TEMP, 'crossattest-comment.md');
+              writeFileSync(file, body, { mode: 0o600 });
+              gh('pr', 'comment', String(revision.number), '--repo', repo, '--body-file', file);
+            }
+            await ack();
+            return true;
+          }
+          async function submitRevision() {
+            const pr = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8')).pull_request;
+            if (pr.head.repo.full_name !== repo || pr.user.login === 'dependabot[bot]') return;
+            const revision = { repository: repo, number: pr.number, base_sha: pr.base.sha, head_sha: pr.head.sha };
+            validateRevision(revision);
+            if (!isCurrent(revision)) return;
+            const compare = 'repos/' + repo + '/compare/' + revision.base_sha + '...' + revision.head_sha;
+            const diff = gh('api', compare, '-H', 'Accept: application/vnd.github.diff');
+            if (!diff.trim()) {
+              console.log('This revision contains no diff to review.');
+              return;
+            }
+            if (diff.length > 120_000) throw new Error('The complete diff exceeds the 120,000-character audit limit.');
+            let report = await request(resource, { diff, revision, title: 'PR audit for ' + repo + '#' + revision.number });
+            const id = report.post_id;
+            if (!await publish(id, revision, report, false)) return;
+            for (let attempt = 0; attempt < 9 && report.review_count === 0; attempt++) {
+              await sleep(20_000);
+              report = await request(resource + '/' + id);
+              if (report.review_count > 0) await publish(id, revision, report, false);
+            }
+            if (report.review_count === 0) console.log('Review pending. A scheduled run will refresh this comment when a verdict arrives.');
+          }
+
+          if (env.GITHUB_EVENT_NAME === 'schedule') {
+            const { deliveries } = await request(resource + '/deliveries', { repository: repo });
+            for (const item of deliveries) {
+              try {
+                validateRevision(item);
+                if (!uuid.test(item.post_id)) throw new Error('Invalid audit ID.');
+                const report = await request(resource + '/' + item.post_id);
+                await publish(item.post_id, item, report, true);
+              } catch (error) {
+                console.error('Could not deliver a queued audit:', error.message);
+                process.exitCode = 1;
+              }
+            }
+          } else {
+            await submitRevision();
+          }
+          CROSSATTEST_JS
